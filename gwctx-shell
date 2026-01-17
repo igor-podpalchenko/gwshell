@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+GWCTX_IFACE="${GWCTX_IFACE:?}"
+GWCTX_GW="${GWCTX_GW:?}"
+MARK_HEX="${MARK_HEX:?}"
+TABLE_ID="${TABLE_ID:?}"
+RULE_PRIO="${RULE_PRIO:?}"
+GWCTX_LOG="${GWCTX_LOG:-/run/gwshell-${TABLE_ID}.log}"
+
+exec > >(tee -a "${GWCTX_LOG}") 2>&1
+log() { printf '%s\n' "$*"; }
+
+IFACE_CIDR="$(
+  ip -4 -o addr show dev "${GWCTX_IFACE}" scope global 2>/dev/null | awk '{print $4}' | head -n1 || true
+)"
+if [[ -z "${IFACE_CIDR}" ]]; then
+  log "ERROR: interface ${GWCTX_IFACE} has no global IPv4 address"
+  ip -4 -o addr show dev "${GWCTX_IFACE}" || true
+  exit 1
+fi
+IFACE_IP="${IFACE_CIDR%%/*}"
+
+BASE_CG_PATH="$(
+  awk -F: '$2=="" {print $3; exit} $2=="unified" {print $3; exit}' /proc/self/cgroup || true
+)"
+if [[ -z "${BASE_CG_PATH}" ]]; then
+  log "ERROR: could not determine cgroup path from /proc/self/cgroup"
+  exit 1
+fi
+[[ "${BASE_CG_PATH}" == /* ]] || BASE_CG_PATH="/${BASE_CG_PATH}"
+
+LEAF_NAME="gwshell-leaf-${TABLE_ID}-$$"
+LEAF_FS_DIR="/sys/fs/cgroup${BASE_CG_PATH}/${LEAF_NAME}"
+LEAF_CG_PATH="${BASE_CG_PATH}/${LEAF_NAME}"
+
+if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
+  mkdir -p "${LEAF_FS_DIR}"
+  echo $$ > "${LEAF_FS_DIR}/cgroup.procs"
+else
+  log "ERROR: cgroup v2 not detected; cannot create leaf cgroup"
+  exit 1
+fi
+
+RCFILE="/run/gwctx.${TABLE_ID}.$$.rc"
+TMPHOME="/run/gwctx-home.${TABLE_ID}.$$/"
+
+cleanup() {
+  set +e
+
+  # remove SNAT first (best effort)
+  iptables -t nat -D POSTROUTING -m mark --mark "${MARK_HEX}/0xffffffff" -o "${GWCTX_IFACE}" \
+    -j SNAT --to-source "${IFACE_IP}" 2>/dev/null || true
+
+  iptables -t mangle -D OUTPUT -m cgroup --path "${LEAF_CG_PATH}" \
+    -j MARK --set-xmark "${MARK_HEX}/0xffffffff" 2>/dev/null || true
+
+  ip -4 rule del pref "${RULE_PRIO}" 2>/dev/null || true
+  ip -4 route flush table "${TABLE_ID}" 2>/dev/null || true
+  ip -4 route flush cache 2>/dev/null || true
+
+  rm -f "${RCFILE}" 2>/dev/null || true
+  rm -rf "${TMPHOME}" 2>/dev/null || true
+  rmdir "${LEAF_FS_DIR}" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# mark packets from this shell context
+iptables -t mangle -A OUTPUT -m cgroup --path "${LEAF_CG_PATH}" \
+  -j MARK --set-xmark "${MARK_HEX}/0xffffffff"
+
+# policy route marked packets
+ip -4 rule add pref "${RULE_PRIO}" fwmark "${MARK_HEX}/0xffffffff" lookup "${TABLE_ID}"
+
+# session table: default via user-supplied gateway
+ip -4 route replace "${GWCTX_GW}/32" dev "${GWCTX_IFACE}" scope link table "${TABLE_ID}"
+ip -4 route replace default via "${GWCTX_GW}" dev "${GWCTX_IFACE}" onlink table "${TABLE_ID}"
+ip -4 route flush cache
+
+# CRITICAL: force correct source IP for marked packets leaving via GWCTX_IFACE
+iptables -t nat -A POSTROUTING -m mark --mark "${MARK_HEX}/0xffffffff" -o "${GWCTX_IFACE}" \
+  -j SNAT --to-source "${IFACE_IP}"
+
+EXT_IP="(unavailable)"
+if command -v curl >/dev/null 2>&1; then
+  set +e
+  EXT_IP="$(
+    curl -4 -sS --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null \
+      | tr -d '\r\n' | head -c 64
+  )"
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 || -z "${EXT_IP}" ]]; then
+    EXT_IP="(unavailable)"
+  fi
+fi
+
+log "=== GW CONTEXT START ==="
+log "IFACE:         ${GWCTX_IFACE} (addr: ${IFACE_CIDR})"
+log "GW (DEFAULT):  ${GWCTX_GW}"
+log "External IP:   ${EXT_IP}"
+log "MARK:          ${MARK_HEX}"
+log "TABLE_ID:      ${TABLE_ID}"
+log "RULE_PRIO:     ${RULE_PRIO}"
+log "CGROUP:        ${LEAF_CG_PATH}"
+log "LOG:           ${GWCTX_LOG}"
+log ""
+
+cat >"${RCFILE}" <<PROFILE
+export GWCTX_IFACE="${GWCTX_IFACE}"
+export GWCTX_GW="${GWCTX_GW}"
+export MARK_HEX="${MARK_HEX}"
+export TABLE_ID="${TABLE_ID}"
+
+gw-route-get() {
+  local dst="\${1:-1.1.1.1}"
+  ip -4 route get "\$dst" mark "\${MARK_HEX}"
+}
+
+gw-check() {
+  echo "== policy rule =="
+  ip -4 rule | grep -n "lookup \${TABLE_ID}" || true
+  echo
+  echo "== table routes =="
+  ip -4 route show table "\${TABLE_ID}" || true
+  echo
+  echo "== nat postrouting (snat for mark) =="
+  iptables -t nat -S POSTROUTING | grep "mark.*\${MARK_HEX}" || true
+}
+
+export PS1="(gwshell:\${TABLE_ID} ${GWCTX_IFACE}->${GWCTX_GW}) \${PS1}"
+PROFILE
+
+mkdir -p "${TMPHOME}"
+cat >"${TMPHOME}/.bashrc" <<BASHRC
+[ -f "${RCFILE}" ] && . "${RCFILE}"
+BASHRC
+
+exec env HOME="${TMPHOME}" bash -i
